@@ -151,6 +151,10 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
             whisper_print_usage(argc, argv, params);
             exit(0);
         }
+        if (arg == "--version") {
+            fprintf(stdout, "whisper.cpp version: %s\n", whisper_version());
+            exit(0);
+        }
         #define ARGV_NEXT (((i + 1) < argc) ? argv[++i] : requires_value_error(arg))
         else if (arg == "-t"    || arg == "--threads")              { params.n_threads       = std::stoi(ARGV_NEXT); }
         else if (arg == "-p"    || arg == "--processors")           { params.n_processors    = std::stoi(ARGV_NEXT); }
@@ -234,6 +238,7 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "\n");
     fprintf(stderr, "options:\n");
     fprintf(stderr, "  -h,        --help                 [default] show this help message and exit\n");
+    fprintf(stderr, "             --version              show version information and exit\n");
     fprintf(stderr, "  -t N,      --threads N            [%-7d] number of threads to use during computation\n",    params.n_threads);
     fprintf(stderr, "  -p N,      --processors N         [%-7d] number of processors to use during computation\n", params.n_processors);
     fprintf(stderr, "  -ot N,     --offset-t N           [%-7d] time offset in milliseconds\n",                    params.offset_t_ms);
@@ -460,7 +465,15 @@ static void output_txt(struct whisper_context * ctx, std::ofstream & fout, const
             speaker = estimate_diarization_speaker(pcmf32s, t0, t1);
         }
 
-        fout << speaker << text << "\n";
+        if (!speaker.empty()) {
+            fout << speaker << text;
+        } else {
+            while (*text == ' ' || *text == '\t') {
+                text++;
+            }
+            fout << text;
+        }
+        fout << "\n";
     }
 }
 
@@ -738,18 +751,47 @@ static void output_json(
                     if (full) {
                         start_arr("tokens");
                         const int n = whisper_full_n_tokens(ctx, i);
-                        for (int j = 0; j < n; ++j) {
-                            auto token = whisper_full_get_token_data(ctx, i, j);
-                            start_obj(nullptr);
-                                value_s("text", whisper_token_to_str(ctx, token.id), false);
-                                if(token.t0 > -1 && token.t1 > -1) {
-                                    // If we have per-token timestamps, write them out
-                                    times_o(token.t0, token.t1, false);
+
+                        // Merge adjacent tokens whose bytes together form a
+                        // single UTF-8 codepoint. Multi-byte characters (CJK
+                        // in particular) can end up split across whisper
+                        // tokens, which used to produce invalid UTF-8 in the
+                        // JSON string. Refs issue #1798.
+                        struct merged_token {
+                            std::string        text;
+                            whisper_token_data data;
+                            int64_t            t1;
+                        };
+                        std::vector<merged_token> merged;
+                        merged.reserve(n);
+                        for (int j = 0; j < n; ) {
+                            auto tok = whisper_full_get_token_data(ctx, i, j);
+                            merged_token m{ whisper_token_to_str(ctx, tok.id), tok, tok.t1 };
+                            ++j;
+                            while (j < n && utf8_trailing_bytes_needed(m.text) > 0) {
+                                auto tok_next = whisper_full_get_token_data(ctx, i, j);
+                                m.text += whisper_token_to_str(ctx, tok_next.id);
+                                if (tok_next.t1 > -1) {
+                                    m.t1 = tok_next.t1;
                                 }
-                                value_i("id", token.id, false);
-                                value_f("p", token.p, false);
-                                value_f("t_dtw", token.t_dtw, true);
-                            end_obj(j == (n - 1));
+                                ++j;
+                            }
+                            merged.push_back(std::move(m));
+                        }
+
+                        const int nm = (int) merged.size();
+                        for (int j = 0; j < nm; ++j) {
+                            const auto & mt = merged[j];
+                            start_obj(nullptr);
+                                value_s("text", mt.text.c_str(), false);
+                                if (mt.data.t0 > -1 && mt.t1 > -1) {
+                                    // If we have per-token timestamps, write them out
+                                    times_o(mt.data.t0, mt.t1, false);
+                                }
+                                value_i("id", mt.data.id, false);
+                                value_f("p", mt.data.p, false);
+                                value_f("t_dtw", mt.data.t_dtw, true);
+                            end_obj(j == (nm - 1));
                         }
                         end_arr(!params.diarize && !params.tinydiarize);
                     }
@@ -926,8 +968,6 @@ static void output_lrc(struct whisper_context * ctx, std::ofstream & fout, const
 static void cb_log_disable(enum ggml_log_level , const char * , void * ) { }
 
 int main(int argc, char ** argv) {
-    ggml_backend_load_all();
-
 #if defined(_WIN32)
     // Set the console output code page to UTF-8, while command line arguments
     // are still encoded in the system's code page. In this way, we can print
@@ -971,12 +1011,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // number of input files that could not be processed or whose output could not be written
+    int n_failed = 0;
+
     // remove non-existent files
     for (auto it = params.fname_inp.begin(); it != params.fname_inp.end();) {
         const auto fname_inp = it->c_str();
 
         if (*it != "-" && !is_file_exist(fname_inp)) {
             fprintf(stderr, "error: input file not found '%s'\n", fname_inp);
+            n_failed++;
             it = params.fname_inp.erase(it);
             continue;
         }
@@ -988,6 +1032,12 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "error: no input files specified\n");
         whisper_print_usage(argc, argv, params);
         return 2;
+    }
+
+    if (!is_file_exist(params.model.c_str())) {
+        fprintf(stderr, "error: model file not found '%s'\n", params.model.c_str());
+        whisper_print_usage(argc, argv, params);
+        return 3;
     }
 
     if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1) {
@@ -1005,6 +1055,8 @@ int main(int argc, char ** argv) {
     if (params.no_prints) {
         whisper_log_set(cb_log_disable, NULL);
     }
+
+    ggml_backend_load_all();
 
     // whisper init
     struct whisper_context_params cparams = whisper_context_default_params();
@@ -1076,6 +1128,7 @@ int main(int argc, char ** argv) {
             const size_t basename_length;
             const bool is_stdout;
             bool used_stdout;
+            bool failed;
             decltype(whisper_print_segment_callback) * const print_segment_callback;
             std::ofstream fout;
 
@@ -1084,6 +1137,7 @@ int main(int argc, char ** argv) {
                     basename_length{fname_out.size()},
                     is_stdout{fname_out == "-"},
                     used_stdout{},
+                    failed{},
                     print_segment_callback{is_stdout ? nullptr : whisper_print_segment_callback} {
                 if (!print_segment_callback) {
                     params.print_progress = false;
@@ -1113,6 +1167,7 @@ int main(int argc, char ** argv) {
                 fout = std::ofstream{fname_out};
                 if (!fout.is_open()) {
                     fprintf(stderr, "%s: failed to open '%s' for writing\n", __func__, fname_out.c_str());
+                    failed = true;
                     return false;
                 }
                 fprintf(stderr, "%s: saving output to '%s'\n", function, fname_out.c_str());
@@ -1125,6 +1180,7 @@ int main(int argc, char ** argv) {
 
         if (!::read_audio_data(fname_inp, pcmf32, pcmf32s, params.diarize)) {
             fprintf(stderr, "error: failed to read audio file '%s'\n", fname_inp.c_str());
+            n_failed++;
             continue;
         }
 
@@ -1275,6 +1331,7 @@ int main(int argc, char ** argv) {
 
             if (whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(), params.n_processors) != 0) {
                 fprintf(stderr, "%s: failed to process audio\n", argv[0]);
+                whisper_free(ctx);
                 return 10;
             }
         }
@@ -1303,12 +1360,21 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "warning: '--output-file -' used without any other '--output-*'");
             }
         }
+
+        if (fout_factory.failed) {
+            n_failed++;
+        }
     }
 
     if (!params.no_prints) {
         whisper_print_timings(ctx);
     }
     whisper_free(ctx);
+
+    if (n_failed > 0) {
+        fprintf(stderr, "error: %d input file(s) failed\n", n_failed);
+        return 11;
+    }
 
     return 0;
 }
