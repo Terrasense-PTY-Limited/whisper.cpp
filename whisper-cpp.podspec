@@ -17,6 +17,10 @@ Pod::Spec.new do |s|
     'include/whisper.h',
     'src/whisper.cpp',
     'src/whisper-arch.h',
+    # ANEForge encoder hook (upstream 2026): stubbed off-device, inert unless
+    # ANEFORGE_ENCODER is set, but whisper.cpp references its symbols.
+    'src/aneforge/whisper-aneforge.h',
+    'src/aneforge/whisper-aneforge.cpp',
 
     # ggml core
     'ggml/include/**/*.h',
@@ -25,6 +29,10 @@ Pod::Spec.new do |s|
     'ggml/src/ggml-alloc.c',
     'ggml/src/ggml-backend.cpp',
     'ggml/src/ggml-backend-reg.cpp',
+    # Meta backend buffers, referenced by ggml-alloc / ggml-backend.
+    'ggml/src/ggml-backend-meta.cpp',
+    # Normally CMake-generated from ggml-version.h.in; checked in for us.
+    'ggml/src/ggml-version.h',
     # Provides dl_load_library / dl_get_sym / dl_error for ggml-backend-reg (dynamic backend loading)
     'ggml/src/ggml-backend-dl.cpp',
     'ggml/src/ggml-opt.cpp',
